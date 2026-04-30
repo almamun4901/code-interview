@@ -1,11 +1,11 @@
 import { assembleCommitContext } from "./context";
 import { callWithRetry } from "./retry";
-import type { GenerationError, QuestionSet } from "./types";
+import type { CommitContext, GenerationError, QuestionSet } from "./types";
 
 export type { CommitContext, GenerationError, Question, QuestionSet } from "./types";
 
 export type GenerateResult =
-  | { ok: true; data: QuestionSet }
+  | { ok: true; data: QuestionSet & { context: CommitContext } }
   | { ok: false; error: GenerationError };
 
 export async function generateQuestions(
@@ -35,6 +35,9 @@ export async function generateQuestions(
 
   return {
     ok: true,
-    data: result.data,
+    data: {
+      ...result.data,
+      context: ctx,
+    },
   };
 }

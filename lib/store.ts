@@ -1,4 +1,5 @@
 import type { Question } from "@/lib/questions/types";
+import type { CommitContext } from "@/lib/questions/types";
 
 import type { AssessmentResult } from "./depth";
 
@@ -17,6 +18,7 @@ export interface InterviewSession {
   completedAt?: string;
   repo?: string;
   sha?: string;
+  context?: CommitContext;
 }
 
 type NewSessionData = Omit<
@@ -27,7 +29,15 @@ type NewSessionData = Omit<
     Pick<InterviewSession, "answers" | "followUpCounts" | "createdAt">
   >;
 
-const sessions = new Map<string, InterviewSession>();
+const globalForSessions = globalThis as typeof globalThis & {
+  __codeInterviewSessions?: Map<string, InterviewSession>;
+};
+
+const sessions =
+  globalForSessions.__codeInterviewSessions ??
+  new Map<string, InterviewSession>();
+
+globalForSessions.__codeInterviewSessions = sessions;
 
 export async function createSession(data: NewSessionData): Promise<string> {
   const id = crypto.randomUUID();
@@ -40,6 +50,7 @@ export async function createSession(data: NewSessionData): Promise<string> {
     completedAt: data.completedAt,
     repo: data.repo,
     sha: data.sha,
+    context: data.context,
   });
 
   return id;

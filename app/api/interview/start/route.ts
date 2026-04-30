@@ -2,6 +2,7 @@ import { getServerSession } from "next-auth";
 
 import { authOptions } from "@/lib/auth";
 import { generateQuestions } from "@/lib/questions";
+import { createSession } from "@/lib/store";
 
 export async function POST(req: Request) {
   const session = await getServerSession(authOptions);
@@ -38,5 +39,19 @@ export async function POST(req: Request) {
     return Response.json({ error: result.error.message }, { status: 500 });
   }
 
-  return Response.json(result.data);
+  const sessionId = await createSession({
+    questions: result.data.questions,
+    repo,
+    sha: result.data.commitSha,
+    context: result.data.context,
+  });
+
+  return Response.json({
+    sessionId,
+    questions: result.data.questions,
+    context: result.data.context,
+    commitSha: result.data.commitSha,
+    generatedAt: result.data.generatedAt,
+    promptVersion: result.data.promptVersion,
+  });
 }

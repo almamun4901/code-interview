@@ -1,0 +1,392 @@
+"use client";
+
+import Link from "next/link";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from "react";
+
+import { AnswerPanel } from "@/app/components/interview/AnswerPanel";
+import {
+  DiffSidebar,
+  type DiffFile,
+} from "@/app/components/interview/DiffSidebar";
+import {
+  EndScreen,
+  type SessionAnswer,
+} from "@/app/components/interview/EndScreen";
+import { Header } from "@/app/components/interview/Header";
+import { QuestionPanel } from "@/app/components/interview/QuestionPanel";
+import type { Question } from "@/lib/questions/types";
+import type { InterviewSession } from "@/lib/store";
+
+interface InterviewClientProps {
+  sessionId: string;
+}
+
+interface AnswerResponse {
+  followUp?: { text: string; isFollowUp: true };
+  next?: Question;
+  sessionComplete?: boolean;
+  assessment: {
+    verdict: "deep" | "shallow";
+    layer: 1 | 2 | 3;
+    reason: string;
+    missingPiece?: string;
+  };
+  error?: string;
+}
+
+interface InterviewState {
+  currentQuestionIndex: number;
+  currentQuestion: Question | null;
+  isFollowUp: boolean;
+  followUpCount: number;
+  isLoading: boolean;
+  isComplete: boolean;
+  sidebarCollapsed: boolean;
+  activeFile: string;
+  answers: SessionAnswer[];
+  followUpsFired: number;
+}
+
+function parseDiffFiles(diff: string, filePaths: string[]): DiffFile[] {
+  const sections = diff.split(/\ndiff --git /);
+  const files = sections
+    .map((section, index) => (index === 0 ? section : `diff --git ${section}`))
+    .filter((section) => section.trim().length > 0)
+    .map((section) => {
+      const header = section.split("\n")[0] ?? "";
+      const match = header.match(/ b\/(.+)$/);
+      const fallback = filePaths.find((path) => section.includes(path));
+      const path = match?.[1] ?? fallback ?? "unknown";
+      const lines = section.split("\n");
+      const additions = lines.filter(
+        (line) => line.startsWith("+") && !line.startsWith("+++"),
+      ).length;
+      const deletions = lines.filter(
+        (line) => line.startsWith("-") && !line.startsWith("---"),
+      ).length;
+
+      return { path, diff: section, additions, deletions };
+    });
+
+  if (files.length > 0) {
+    return files;
+  }
+
+  return filePaths.map((path) => ({
+    path,
+    diff,
+    additions: diff
+      .split("\n")
+      .filter((line) => line.startsWith("+") && !line.startsWith("+++")).length,
+    deletions: diff
+      .split("\n")
+      .filter((line) => line.startsWith("-") && !line.startsWith("---")).length,
+  }));
+}
+
+function matchFileToQuestion(question: Question, files: DiffFile[]): string {
+  const referenced = files.find(
+    (file) =>
+      file.path.includes(question.artifactReferenced) ||
+      question.artifactReferenced.includes(file.path),
+  );
+  return referenced?.path ?? files[0]?.path ?? "";
+}
+
+function usePrefersReducedMotion() {
+  return useSyncExternalStore(
+    (onStoreChange) => {
+      const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+      media.addEventListener("change", onStoreChange);
+      return () => media.removeEventListener("change", onStoreChange);
+    },
+    () => window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+    () => false,
+  );
+}
+
+function useTypedText(text: string, speed = 18, enabled = true): string {
+  const [typed, setTyped] = useState({ source: "", displayed: "" });
+
+  useEffect(() => {
+    if (!text || !enabled) return;
+
+    let i = 0;
+    const interval = setInterval(() => {
+      setTyped({ source: text, displayed: text.slice(0, i + 1) });
+      i++;
+      if (i >= text.length) clearInterval(interval);
+    }, speed);
+
+    return () => clearInterval(interval);
+  }, [enabled, speed, text]);
+
+  if (!enabled) return text;
+  return typed.source === text ? typed.displayed : "";
+}
+
+export function InterviewClient({ sessionId }: InterviewClientProps) {
+  const [session, setSession] = useState<InterviewSession | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [answerError, setAnswerError] = useState<string | null>(null);
+  const [resetKey, setResetKey] = useState(0);
+  const [state, setState] = useState<InterviewState>({
+    currentQuestionIndex: 0,
+    currentQuestion: null,
+    isFollowUp: false,
+    followUpCount: 0,
+    isLoading: false,
+    isComplete: false,
+    sidebarCollapsed: false,
+    activeFile: "",
+    answers: [],
+    followUpsFired: 0,
+  });
+
+  const files = useMemo(
+    () => parseDiffFiles(session?.context?.diff ?? "", session?.context?.filePaths ?? []),
+    [session],
+  );
+  const prefersReduced = usePrefersReducedMotion();
+  const displayedQuestion = useTypedText(
+    state.currentQuestion?.text ?? "",
+    18,
+    !prefersReduced,
+  );
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadSession() {
+      setLoadError(null);
+      const response = await fetch(`/api/interview/session/${sessionId}`);
+      const data = (await response.json()) as InterviewSession & { error?: string };
+
+      if (!isMounted) return;
+
+      if (!response.ok) {
+        setLoadError(
+          response.status === 404
+            ? "Session not found or expired."
+            : data.error ?? "Unable to load session.",
+        );
+        return;
+      }
+
+      const parsedFiles = parseDiffFiles(data.context?.diff ?? "", data.context?.filePaths ?? []);
+      const firstQuestion = data.questions[0] ?? null;
+      const restoredAnswers: SessionAnswer[] = Object.entries(data.answers ?? {}).map(
+        ([key, answer]) => {
+          const questionId = key.split("_")[0];
+          const question =
+            data.questions.find((item) => item.id === questionId) ??
+            data.questions[0];
+          return { key, question, answer };
+        },
+      );
+
+      setSession(data);
+      setState((current) => ({
+        ...current,
+        currentQuestion: firstQuestion,
+        activeFile: firstQuestion ? matchFileToQuestion(firstQuestion, parsedFiles) : "",
+        isComplete: Boolean(data.completedAt),
+        answers: restoredAnswers,
+        followUpsFired: Object.values(data.followUpCounts ?? {}).reduce(
+          (total, count) => total + count,
+          0,
+        ),
+      }));
+    }
+
+    const timer = window.setTimeout(() => void loadSession(), 0);
+
+    return () => {
+      isMounted = false;
+      window.clearTimeout(timer);
+    };
+  }, [sessionId]);
+
+  const handleSubmit = useCallback(
+    async (answer: string) => {
+      if (!state.currentQuestion || !session) return;
+
+      const submittedQuestion = state.currentQuestion;
+      const submittedFollowUpCount = state.followUpCount;
+      setState((current) => ({ ...current, isLoading: true }));
+      setAnswerError(null);
+
+      try {
+        const response = await fetch("/api/interview/answer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId,
+            questionId: submittedQuestion.id,
+            answer,
+          }),
+        });
+        const data = (await response.json()) as AnswerResponse;
+
+        if (!response.ok) {
+          throw new Error(data.error ?? "Something went wrong");
+        }
+
+        const storedAnswer: SessionAnswer = {
+          key: `${submittedQuestion.id}_${submittedFollowUpCount}`,
+          question: submittedQuestion,
+          answer: {
+            answer,
+            assessment: data.assessment,
+            timestamp: new Date().toISOString(),
+          },
+        };
+
+        setState((current) => {
+          const answers = [...current.answers, storedAnswer];
+
+          if (data.followUp && current.currentQuestion) {
+            return {
+              ...current,
+              currentQuestion: {
+                ...current.currentQuestion,
+                text: data.followUp.text,
+              },
+              isFollowUp: true,
+              followUpCount: current.followUpCount + 1,
+              isLoading: false,
+              answers,
+              followUpsFired: current.followUpsFired + 1,
+            };
+          }
+
+          if (data.next) {
+            return {
+              ...current,
+              currentQuestionIndex: current.currentQuestionIndex + 1,
+              currentQuestion: data.next,
+              isFollowUp: false,
+              followUpCount: 0,
+              activeFile: matchFileToQuestion(data.next, files),
+              isLoading: false,
+              answers,
+            };
+          }
+
+          if (data.sessionComplete) {
+            return {
+              ...current,
+              isComplete: true,
+              isLoading: false,
+              answers,
+            };
+          }
+
+          return { ...current, isLoading: false, answers };
+        });
+        setResetKey((key) => key + 1);
+      } catch {
+        setAnswerError("Something went wrong — try submitting again.");
+        setState((current) => ({ ...current, isLoading: false }));
+      }
+    },
+    [files, session, sessionId, state.currentQuestion, state.followUpCount],
+  );
+
+  if (loadError) {
+    return (
+      <main className="state-page">
+        <section className="state-card">
+          <p className="ci-error">{loadError}</p>
+          <Link className="ci-button ci-button-primary" href="/">
+            Back to repos
+          </Link>
+        </section>
+      </main>
+    );
+  }
+
+  if (!session || !state.currentQuestion) {
+    return (
+      <main className="state-page">
+        <section className="state-card">Loading session...</section>
+      </main>
+    );
+  }
+
+  const context = session.context;
+  const repoFullName = context?.repoFullName ?? session.repo ?? "unknown/repo";
+  const commitSha = context?.commitSha ?? session.sha ?? "";
+  const shortSha = context?.shortSha ?? commitSha.slice(0, 7);
+  const commitMessage = context?.commitMessage ?? "Commit interview";
+
+  if (state.isComplete) {
+    return (
+      <EndScreen
+        repoFullName={repoFullName}
+        shortSha={shortSha}
+        commitMessage={commitMessage}
+        questionCount={session.questions.length}
+        deepCount={
+          state.answers.filter((item) => item.answer.assessment.verdict === "deep")
+            .length
+        }
+        followUpsFired={state.followUpsFired}
+        answers={state.answers}
+      />
+    );
+  }
+
+  return (
+    <div className="interview-shell">
+      <Header
+        repoFullName={repoFullName}
+        commitSha={commitSha}
+        shortSha={shortSha}
+        commitMessage={commitMessage}
+        currentQuestion={state.currentQuestionIndex + 1}
+        totalQuestions={session.questions.length}
+      />
+      <div className="interview-main">
+        <DiffSidebar
+          files={files}
+          activeFile={state.activeFile}
+          referencedFile={state.currentQuestion.artifactReferenced}
+          onFileSelect={(path) =>
+            setState((current) => ({ ...current, activeFile: path }))
+          }
+          collapsed={state.sidebarCollapsed}
+          onToggle={() =>
+            setState((current) => ({
+              ...current,
+              sidebarCollapsed: !current.sidebarCollapsed,
+            }))
+          }
+        />
+        <div className="interview-content">
+          <QuestionPanel
+            question={state.currentQuestion}
+            questionIndex={state.currentQuestionIndex}
+            totalQuestions={session.questions.length}
+            isFollowUp={state.isFollowUp}
+            followUpCount={state.followUpCount}
+            displayedText={displayedQuestion}
+          />
+          <AnswerPanel
+            key={resetKey}
+            onSubmit={handleSubmit}
+            isLoading={state.isLoading}
+            disabled={state.isLoading}
+            error={answerError}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
