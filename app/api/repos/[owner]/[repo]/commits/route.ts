@@ -25,7 +25,7 @@ export async function GET(
       return Response.json({ diff });
     }
 
-    const commits = await getRecentCommits(session.accessToken, repoFullName, 5);
+    const commits = await getRecentCommits(session.accessToken, repoFullName, 10);
 
     return Response.json({ commits });
   } catch (error) {
