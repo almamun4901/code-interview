@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:questions": "tsx scripts/test-questions.ts"
+    "test:questions": "tsx scripts/test-questions.ts",
+    "test:depth": "tsx scripts/test-depth.ts",
+    "test:depth:integration": "tsx scripts/test-depth-integration.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",
