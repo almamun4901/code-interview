@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
 } from "react";
@@ -51,6 +52,13 @@ interface InterviewState {
   activeFile: string;
   answers: SessionAnswer[];
   followUpsFired: number;
+}
+
+type VoiceCommand = "repeat" | "clarify";
+
+interface ClarifyResponse {
+  text?: string;
+  error?: string;
 }
 
 function parseDiffFiles(diff: string, filePaths: string[]): DiffFile[] {
@@ -135,7 +143,14 @@ export function InterviewClient({ sessionId }: InterviewClientProps) {
   const [session, setSession] = useState<InterviewSession | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [answerError, setAnswerError] = useState<string | null>(null);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceMuted, setVoiceMuted] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [clarifiedQuestion, setClarifiedQuestion] = useState<string | null>(null);
+  const [isClarifying, setIsClarifying] = useState(false);
   const [resetKey, setResetKey] = useState(0);
+  const speechTokenRef = useRef(0);
   const [state, setState] = useState<InterviewState>({
     currentQuestionIndex: 0,
     currentQuestion: null,
@@ -155,9 +170,57 @@ export function InterviewClient({ sessionId }: InterviewClientProps) {
   );
   const prefersReduced = usePrefersReducedMotion();
   const displayedQuestion = useTypedText(
-    state.currentQuestion?.text ?? "",
+    clarifiedQuestion ?? state.currentQuestion?.text ?? "",
     18,
     !prefersReduced,
+  );
+  const speechSupported =
+    typeof window !== "undefined" && "speechSynthesis" in window;
+
+  const stopSpeaking = useCallback(() => {
+    if (!speechSupported) {
+      return;
+    }
+
+    speechTokenRef.current += 1;
+    window.speechSynthesis.cancel();
+    setIsSpeaking(false);
+  }, [speechSupported]);
+
+  const speakQuestion = useCallback(
+    (text: string) => {
+      if (!speechSupported || voiceMuted || !text.trim()) {
+        return;
+      }
+
+      speechTokenRef.current += 1;
+      const token = speechTokenRef.current;
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "en-US";
+      utterance.rate = 0.95;
+      utterance.pitch = 1;
+      utterance.onstart = () => {
+        if (speechTokenRef.current === token) {
+          setIsSpeaking(true);
+        }
+      };
+      utterance.onend = () => {
+        if (speechTokenRef.current === token) {
+          setIsSpeaking(false);
+        }
+      };
+      utterance.onerror = () => {
+        if (speechTokenRef.current === token) {
+          setIsSpeaking(false);
+          setVoiceError("Spoken questions are unavailable right now. The text is still shown.");
+        }
+      };
+
+      window.speechSynthesis.speak(utterance);
+    },
+    [speechSupported, voiceMuted],
   );
 
   useEffect(() => {
@@ -192,6 +255,7 @@ export function InterviewClient({ sessionId }: InterviewClientProps) {
       );
 
       setSession(data);
+      setClarifiedQuestion(null);
       setState((current) => ({
         ...current,
         currentQuestion: firstQuestion,
@@ -212,6 +276,29 @@ export function InterviewClient({ sessionId }: InterviewClientProps) {
       window.clearTimeout(timer);
     };
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!voiceEnabled || voiceMuted || !state.currentQuestion) {
+      return;
+    }
+
+    if (!speechSupported) {
+      return;
+    }
+
+    speakQuestion(clarifiedQuestion ?? state.currentQuestion.text);
+
+    return () => {
+      window.speechSynthesis.cancel();
+    };
+  }, [
+    clarifiedQuestion,
+    speakQuestion,
+    speechSupported,
+    state.currentQuestion,
+    voiceEnabled,
+    voiceMuted,
+  ]);
 
   const handleSubmit = useCallback(
     async (answer: string) => {
@@ -247,6 +334,10 @@ export function InterviewClient({ sessionId }: InterviewClientProps) {
             timestamp: new Date().toISOString(),
           },
         };
+
+        if (data.followUp || data.next) {
+          setClarifiedQuestion(null);
+        }
 
         setState((current) => {
           const answers = [...current.answers, storedAnswer];
@@ -297,6 +388,78 @@ export function InterviewClient({ sessionId }: InterviewClientProps) {
       }
     },
     [files, session, sessionId, state.currentQuestion, state.followUpCount],
+  );
+
+  const handleVoiceToggle = useCallback(() => {
+    setVoiceEnabled((enabled) => {
+      const next = !enabled;
+      if (!next) {
+        stopSpeaking();
+      } else if (!speechSupported) {
+        setVoiceError("Spoken questions are not supported in this browser.");
+      }
+      return next;
+    });
+  }, [speechSupported, stopSpeaking]);
+
+  const handleReplay = useCallback(() => {
+    if (!state.currentQuestion) {
+      return;
+    }
+
+    if (!speechSupported) {
+      setVoiceError("Spoken questions are not supported in this browser.");
+      return;
+    }
+
+    setVoiceError(null);
+    speakQuestion(clarifiedQuestion ?? state.currentQuestion.text);
+  }, [clarifiedQuestion, speakQuestion, speechSupported, state.currentQuestion]);
+
+  const handleVoiceCommand = useCallback(
+    async (command: VoiceCommand, transcript: string) => {
+      if (!state.currentQuestion) {
+        return;
+      }
+
+      if (command === "repeat") {
+        handleReplay();
+        return;
+      }
+
+      setIsClarifying(true);
+      setVoiceError(null);
+
+      try {
+        const response = await fetch("/api/interview/clarify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId,
+            questionId: state.currentQuestion.id,
+            currentText: clarifiedQuestion ?? state.currentQuestion.text,
+            userCommand: transcript,
+          }),
+        });
+        const data = (await response.json()) as ClarifyResponse;
+
+        if (!response.ok || !data.text) {
+          throw new Error(data.error ?? "Unable to clarify");
+        }
+
+        setClarifiedQuestion(data.text);
+      } catch {
+        setVoiceError("I couldn't clarify that question. Try replaying it or keep answering in your own words.");
+      } finally {
+        setIsClarifying(false);
+      }
+    },
+    [
+      clarifiedQuestion,
+      handleReplay,
+      sessionId,
+      state.currentQuestion,
+    ],
   );
 
   if (loadError) {
@@ -377,6 +540,24 @@ export function InterviewClient({ sessionId }: InterviewClientProps) {
             isFollowUp={state.isFollowUp}
             followUpCount={state.followUpCount}
             displayedText={displayedQuestion}
+            voiceEnabled={voiceEnabled}
+            voiceSupported={speechSupported}
+            voiceMuted={voiceMuted}
+            isSpeaking={isSpeaking}
+            isClarifying={isClarifying}
+            voiceError={voiceError}
+            onVoiceToggle={handleVoiceToggle}
+            onMuteToggle={() => {
+              setVoiceMuted((muted) => {
+                const next = !muted;
+                if (next) {
+                  stopSpeaking();
+                }
+                return next;
+              });
+            }}
+            onReplay={handleReplay}
+            onStopSpeaking={stopSpeaking}
           />
           <AnswerPanel
             key={resetKey}
@@ -384,6 +565,8 @@ export function InterviewClient({ sessionId }: InterviewClientProps) {
             isLoading={state.isLoading}
             disabled={state.isLoading}
             error={answerError}
+            voiceEnabled={voiceEnabled}
+            onVoiceCommand={handleVoiceCommand}
           />
         </div>
       </div>
